@@ -51,8 +51,9 @@ def fetch_and_store_amazon_books_etl():
             author VARCHAR(255),
             avg_rating FLOAT,
             avg_price FLOAT,
-            avg_paperback_price FLOAT,
-            avg_hardcover_price FLOAT
+            Total_rating_count INT,
+            sum_rating INT,
+            book_count INT
         );
         """
         cursor.execute(create_table_query)
@@ -151,34 +152,36 @@ def fetch_and_store_amazon_books_etl():
         @task(task_id="enrich_book_data")
         def enrich_book_data(standardised_books: pd.DataFrame):
 
-            # Transform the data
+            # Create a copy of the dataframe
             copy = standardised_books.copy()
-            enriched_data = pd.DataFrame()
+            metrics_dataFrame = pd.DataFrame()
 
             # check data validity
             if copy.empty:
                 raise ValueError('No books found')
 
+            copy.drop(columns=['Title'])
 
-            enriched_data["Author"] = copy["Author"].unique()
+            # Average rating by author: Sum of (Rating * Rating_count) / Total Rating count
+            # Extract the summation into a separate dataframe
+            sum_rating_count_rating = copy.groupby('Author').apply(lambda x: (x['Rating'] * x['Rating_count']).sum()).reset_index(name='Sum_rating_count_rating')
 
-            # Average rating of Author = mean(Rating)
-            enriched_data["Average rating of Author"] = copy.groupby("Author")["Rating"].mean()
-            enriched_data["Average rating of Author"].fillna(0, inplace=True) # fill NaN values with 0
-            
-            # Average price of Author = mean(Price)
-            enriched_data["Average price of Author"] = copy.groupby("Author")["Price"].mean()
-            enriched_data["Average price of Author"].fillna(0, inplace=True) # fill NaN values with 0
+            # Extract the total rating count into a separate dataframe
+            total_rating_count = copy.groupby('Author')['Rating_count'].sum().reset_index(name='Total_rating_count')
 
-            # Average Paperback price = mean(Price) where book_type = Paperback
-            enriched_data["Average Paperback price"] = copy[copy["book_type"] == "Paperback"]["Price"].mean()
-            enriched_data["Average Paperback price"].fillna(0, inplace=True) # fill NaN values with 0
+            # Join the two dataframes and calculate the average rating
+            metrics_dataFrame = pd.merge(total_rating_count, sum_rating_count_rating, on='Author')
+            metrics_dataFrame['Average_rating'] = metrics_dataFrame['Sum_rating_count_rating'] / metrics_dataFrame['Total_rating_count']
 
-            # Average Hardcover price = mean(Price) where book_type = Hardcover
-            enriched_data["Average Hardcover price"] = copy[copy["book_type"] == "Hardcover"]["Price"].mean()
-            enriched_data["Average Hardcover price"].fillna(0, inplace=True) # fill NaN values with 0
+            # Compute Average price by author
+            mean_price = copy.groupby('Author')['Price'].mean().reset_index(name='Average_price')
+            metrics_dataFrame = pd.merge(metrics_dataFrame, mean_price, on='Author')
 
-            return enriched_data.to_dict(orient='records')
+            # Book count by author
+            book_count = copy.groupby('Author').size().reset_index(name='Book_count')
+            metrics_dataFrame = pd.merge(metrics_dataFrame, book_count, on='Author')
+
+            return metrics_dataFrame.to_dict(orient='records')
         
         standardised_book_data = standardise_book_data(books)
         return (enrich_book_data(standardised_book_data), standardised_book_data)
@@ -193,12 +196,12 @@ def fetch_and_store_amazon_books_etl():
         # Load the data via the hook
         postgres_hook = PostgresHook(postgres_conn_id='books_connection')
         insertion_query = """
-        INSERT INTO enriched_metrics (author, avg_rating, avg_price, avg_paperback_price, avg_hardcover_price)
-        VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO enriched_metrics (author, avg_rating, avg_price, total_rating_count, sum_rating, book_count)
+        VALUES (%s, %s, %s, %s, %s, %s)
         """
 
         for entry in enriched_metrics:
-            postgres_hook.run(insertion_query, parameters=(entry["Author"], entry["Average rating of Author"], entry["Average price of Author"], entry["Average Paperback price"], entry["Average Hardcover price"]))
+            postgres_hook.run(insertion_query, parameters=(entry["Author"], entry["Average_rating"], entry["Average_price"], entry["Total_rating_count"], entry["Sum_rating_count_rating"], entry["Book_count"]))
 
         pass
 
